@@ -1,0 +1,331 @@
+// =========================================================
+// VMSS RAG STATUS DASHBOARD - MAIN QUERY
+// =========================================================
+// This query provides a comprehensive Red-Amber-Green status view
+// Perfect for displaying on monitors in operations centers
+// Update every 2-5 minutes for real-time monitoring
+
+// Configuration Parameters (adjust these based on your requirements)
+let MonitoringWindow = 10m;          // How recent data to consider
+let CPUCriticalThreshold = 85.0;     // CPU% that triggers RED status
+let CPUWarningThreshold = 75.0;      // CPU% that triggers AMBER status
+let MemoryCriticalMB = 512;          // Available memory MB for RED status
+let MemoryWarningMB = 1024;          // Available memory MB for AMBER status
+let DiskCriticalPercent = 10.0;      // Free disk % for RED status
+let DiskWarningPercent = 20.0;       // Free disk % for AMBER status
+let InstanceOfflineMinutes = 5;      // Minutes offline before considering critical
+let HealthPercentageRed = 70.0;      // Overall health % threshold for RED
+let HealthPercentageAmber = 90.0;    // Overall health % threshold for AMBER
+
+// Core Data Collection - Map computer names to VMSS names
+let VMSSMapping = 
+    VMComputer
+    | where TimeGenerated > ago(4h)
+    | where isnotempty(AzureResourceName)
+    | extend VMSSName = case(
+        AzureResourceName contains "_", tostring(split(AzureResourceName, "_")[0]),
+        AzureResourceName contains "-", strcat_array(split(AzureResourceName, "-")[:array_length(split(AzureResourceName, "-"))-1], "-"),
+        AzureResourceName
+    )
+    | extend InstanceNumber = case(
+        AzureResourceName contains "_", toint(split(AzureResourceName, "_")[1]),
+        AzureResourceName contains "-", toint(split(AzureResourceName, "-")[array_length(split(AzureResourceName, "-"))-1]),
+        0
+    )
+    | distinct Computer, VMSSName, ResourceGroupName=AzureResourceGroup, InstanceNumber, AzureResourceName;
+
+// Instance Availability Status - Check which instances are online
+let InstanceHealth = 
+    Heartbeat
+    | where TimeGenerated > ago(MonitoringWindow)
+    | where Computer startswith "vmss"
+    | summarize LastSeen = max(TimeGenerated) by Computer
+    | extend MinutesOffline = datetime_diff('minute', now(), LastSeen)
+    | extend InstanceStatus = case(
+        MinutesOffline <= 2, "Healthy",
+        MinutesOffline <= 5, "Warning",
+        "Critical"
+    )
+    | extend InstanceStatusScore = case(
+        InstanceStatus == "Healthy", 100, 
+        InstanceStatus == "Warning", 50, 
+        0
+    );
+
+// CPU Performance Metrics - Monitor CPU utilization
+let CPUMetrics = 
+    Perf
+    | where TimeGenerated > ago(MonitoringWindow)
+    | where ObjectName == "Processor" and CounterName == "% Processor Time" and InstanceName == "_Total"
+    | where Computer startswith "vmss"
+    | summarize 
+        AvgCPU = avg(CounterValue), 
+        MaxCPU = max(CounterValue),
+        MinCPU = min(CounterValue),
+        StdDevCPU = stdev(CounterValue)
+        by Computer
+    | extend CPUStatus = case(
+        AvgCPU >= CPUCriticalThreshold, "Critical",
+        AvgCPU >= CPUWarningThreshold, "Warning",
+        "Healthy"
+    )
+    | extend CPUStatusScore = case(
+        CPUStatus == "Healthy", 100, 
+        CPUStatus == "Warning", 50, 
+        0
+    );
+
+// Memory Performance Metrics - Monitor available memory
+let MemoryMetrics = 
+    Perf
+    | where TimeGenerated > ago(MonitoringWindow)
+    | where ObjectName == "Memory" and CounterName == "Available MBytes"
+    | where Computer startswith "vmss"
+    | summarize 
+        AvgAvailableMemoryMB = avg(CounterValue), 
+        MinAvailableMemoryMB = min(CounterValue),
+        MaxAvailableMemoryMB = max(CounterValue)
+        by Computer
+    | extend MemoryStatus = case(
+        MinAvailableMemoryMB <= MemoryCriticalMB, "Critical",
+        MinAvailableMemoryMB <= MemoryWarningMB, "Warning", 
+        "Healthy"
+    )
+    | extend MemoryStatusScore = case(
+        MemoryStatus == "Healthy", 100, 
+        MemoryStatus == "Warning", 50, 
+        0
+    )
+    | extend MemoryUsagePercent = 100 - (AvgAvailableMemoryMB / 8192 * 100);  // Assuming 8GB VMs - adjust as needed
+
+// Disk Space Metrics - Monitor free disk space
+let DiskMetrics = 
+    Perf
+    | where TimeGenerated > ago(15m)
+    | where ObjectName == "LogicalDisk" and CounterName == "% Free Space"
+    | where Computer startswith "vmss" and InstanceName in ("C:", "/")  // Windows C: or Linux /
+    | summarize 
+        MinDiskFreePercent = min(CounterValue),
+        AvgDiskFreePercent = avg(CounterValue)
+        by Computer
+    | extend DiskStatus = case(
+        MinDiskFreePercent <= DiskCriticalPercent, "Critical",
+        MinDiskFreePercent <= DiskWarningPercent, "Warning",
+        "Healthy"
+    )
+    | extend DiskStatusScore = case(
+        DiskStatus == "Healthy", 100, 
+        DiskStatus == "Warning", 50, 
+        0
+    );
+
+// Network Performance Metrics - Monitor network throughput
+let NetworkMetrics = 
+    Perf
+    | where TimeGenerated > ago(MonitoringWindow)
+    | where ObjectName == "Network Interface" and CounterName == "Bytes Total/sec"
+    | where Computer startswith "vmss"
+    | where InstanceName !in ("isatap", "Loopback Pseudo-Interface 1")
+    | summarize 
+        AvgNetworkBytesPerSec = avg(CounterValue),
+        MaxNetworkBytesPerSec = max(CounterValue)
+        by Computer
+    | extend NetworkMbps = round(AvgNetworkBytesPerSec * 8 / 1024 / 1024, 2);
+
+// Application/Service Health - Monitor Windows services
+let ServiceHealth = 
+    Event
+    | where TimeGenerated > ago(30m)
+    | where Source == "Service Control Manager"
+    | where EventID in (7034, 7036)  // Service failures and state changes
+    | where Computer startswith "vmss"
+    | extend ServiceName = extract(@"([^\\s]+)", 1, RenderedDescription)
+    | where ServiceName in ("W3SVC", "WAS", "MSSQLSERVER")  // Customize service list
+    | summarize 
+        ServiceErrors = countif(EventID == 7034),
+        ServiceEvents = count(),
+        LastServiceEvent = max(TimeGenerated)
+        by Computer
+    | extend ServiceStatus = case(
+        ServiceErrors > 0, "Critical",
+        datetime_diff('minute', now(), LastServiceEvent) > 60, "Warning",
+        "Healthy"
+    )
+    | extend ServiceStatusScore = case(
+        ServiceStatus == "Healthy", 100, 
+        ServiceStatus == "Warning", 50, 
+        0
+    );
+
+// Main RAG Status Calculation - Combine all metrics
+VMSSMapping
+| join kind=leftouter InstanceHealth on Computer
+| join kind=leftouter CPUMetrics on Computer
+| join kind=leftouter MemoryMetrics on Computer  
+| join kind=leftouter DiskMetrics on Computer
+| join kind=leftouter NetworkMetrics on Computer
+| join kind=leftouter ServiceHealth on Computer
+| extend 
+    // Fill missing values with appropriate defaults
+    InstanceStatus = iff(isempty(InstanceStatus), "Critical", InstanceStatus),
+    InstanceStatusScore = iff(isempty(InstanceStatusScore), 0, InstanceStatusScore),
+    AvgCPU = iff(isempty(AvgCPU), 100.0, AvgCPU),
+    MaxCPU = iff(isempty(MaxCPU), 100.0, MaxCPU),
+    CPUStatus = iff(isempty(CPUStatus), "Critical", CPUStatus),
+    CPUStatusScore = iff(isempty(CPUStatusScore), 0, CPUStatusScore),
+    MemoryStatus = iff(isempty(MemoryStatus), "Critical", MemoryStatus),
+    MemoryStatusScore = iff(isempty(MemoryStatusScore), 0, MemoryStatusScore),
+    MemoryUsagePercent = iff(isempty(MemoryUsagePercent), 100.0, MemoryUsagePercent),
+    DiskStatus = iff(isempty(DiskStatus), "Warning", DiskStatus),
+    DiskStatusScore = iff(isempty(DiskStatusScore), 50, DiskStatusScore),
+    ServiceStatus = iff(isempty(ServiceStatus), "Healthy", ServiceStatus),
+    ServiceStatusScore = iff(isempty(ServiceStatusScore), 100, ServiceStatusScore),
+    NetworkMbps = iff(isempty(NetworkMbps), 0.0, NetworkMbps),
+    MinutesOffline = iff(isempty(MinutesOffline), 999, MinutesOffline)
+| summarize 
+    // Instance counts and health
+    TotalInstances = count(),
+    HealthyInstances = countif(InstanceStatus == "Healthy"),
+    WarningInstances = countif(InstanceStatus == "Warning"), 
+    CriticalInstances = countif(InstanceStatus == "Critical"),
+    
+    // Performance aggregates
+    AvgCPUAcrossVMSS = avg(AvgCPU),
+    MaxCPUInVMSS = max(MaxCPU),
+    MinCPUInVMSS = min(AvgCPU),
+    CPUStdDev = stdev(AvgCPU),
+    
+    AvgMemoryUsage = avg(MemoryUsagePercent),
+    MaxMemoryUsage = max(MemoryUsagePercent),
+    MinAvailableMemory = min(AvgAvailableMemoryMB),
+    
+    MinDiskSpace = min(MinDiskFreePercent),
+    AvgDiskSpace = avg(MinDiskFreePercent),
+    
+    AvgNetworkMbps = avg(NetworkMbps),
+    MaxNetworkMbps = max(NetworkMbps),
+    
+    // Status counts by category
+    CPUCriticalCount = countif(CPUStatus == "Critical"),
+    CPUWarningCount = countif(CPUStatus == "Warning"),
+    MemoryCriticalCount = countif(MemoryStatus == "Critical"),
+    MemoryWarningCount = countif(MemoryStatus == "Warning"),
+    DiskCriticalCount = countif(DiskStatus == "Critical"),
+    DiskWarningCount = countif(DiskStatus == "Warning"),
+    ServiceCriticalCount = countif(ServiceStatus == "Critical"),
+    ServiceWarningCount = countif(ServiceStatus == "Warning"),
+    
+    // Composite health score (weighted average)
+    CompositeHealthScore = avg(
+        (InstanceStatusScore * 0.3) +      // 30% weight on availability
+        (CPUStatusScore * 0.25) +          // 25% weight on CPU
+        (MemoryStatusScore * 0.25) +       // 25% weight on Memory  
+        (DiskStatusScore * 0.1) +          // 10% weight on Disk
+        (ServiceStatusScore * 0.1)         // 10% weight on Services
+    ),
+    
+    // Worst performing instances for troubleshooting
+    WorstCPUInstance = argmax(AvgCPU, Computer),
+    WorstMemoryInstance = argmin(AvgAvailableMemoryMB, Computer),
+    
+    // Last update timestamp
+    LastDataPoint = max(TimeGenerated),
+    LastUpdate = now()
+    
+    by VMSSName, ResourceGroupName
+| extend 
+    // Calculate overall health percentage
+    HealthPercentage = round(CompositeHealthScore, 1),
+    
+    // Determine Priority Score (lower = higher priority for sorting)
+    PriorityScore = case(
+        CriticalInstances > 0 or CPUCriticalCount > 0 or MemoryCriticalCount > 0 or ServiceCriticalCount > 0, 1,  // Critical issues
+        WarningInstances > 0 or CPUWarningCount > 0 or MemoryWarningCount > 0 or DiskCriticalCount > 0, 2,      // Warning issues
+        HealthPercentage < HealthPercentageAmber, 3,                                                              // Below amber threshold
+        4  // All good
+    ),
+    
+    // Advanced RAG Status with multiple factors
+    OverallRAGStatus = case(
+        // RED: Critical issues or very low health
+        CriticalInstances > 0 or 
+        CPUCriticalCount > 0 or 
+        MemoryCriticalCount > 0 or 
+        DiskCriticalCount > 0 or 
+        ServiceCriticalCount > 0 or 
+        HealthPercentage < HealthPercentageRed or
+        MaxCPUInVMSS > 95 or
+        MinAvailableMemory < 256, "🔴 CRITICAL",
+        
+        // AMBER: Warning conditions or moderate health issues
+        WarningInstances > 0 or 
+        CPUWarningCount > 0 or 
+        MemoryWarningCount > 0 or 
+        DiskWarningCount > 0 or 
+        ServiceWarningCount > 0 or 
+        HealthPercentage < HealthPercentageAmber or
+        AvgCPUAcrossVMSS > CPUWarningThreshold or
+        AvgMemoryUsage > 80, "🟡 WARNING",
+        
+        // GREEN: All systems healthy
+        "🟢 HEALTHY"
+    ),
+    
+    // Performance trend indicators
+    CPUTrend = case(
+        CPUStdDev > 20, "📈 Variable",
+        MaxCPUInVMSS - MinCPUInVMSS > 30, "⚖️ Unbalanced", 
+        "📊 Stable"
+    ),
+    
+    // Create detailed issue summary with emojis for visual impact
+    IssuesSummary = strcat_array(
+        pack_array(
+            iff(CriticalInstances > 0, strcat("🚨 ", CriticalInstances, " DOWN"), ""),
+            iff(CPUCriticalCount > 0, strcat("🔥 ", CPUCriticalCount, " CPU>", CPUCriticalThreshold, "%"), ""),
+            iff(MemoryCriticalCount > 0, strcat("💾 ", MemoryCriticalCount, " MEM<", MemoryCriticalMB, "MB"), ""),
+            iff(DiskCriticalCount > 0, strcat("💿 ", DiskCriticalCount, " DISK<", DiskCriticalPercent, "%"), ""),
+            iff(ServiceCriticalCount > 0, strcat("⚙️ ", ServiceCriticalCount, " SVC FAIL"), ""),
+            iff(WarningInstances > 0, strcat("⚠️ ", WarningInstances, " WARN"), ""),
+            iff(CPUWarningCount > 0, strcat("📊 ", CPUWarningCount, " CPU>", CPUWarningThreshold, "%"), ""),
+            iff(MemoryWarningCount > 0, strcat("📈 ", MemoryWarningCount, " MEM<", MemoryWarningMB, "MB"), "")
+        ) | where isnotempty(pack_array), " | "
+    ),
+    
+    // Resource utilization summary
+    ResourceSummary = strcat(
+        "CPU:", round(AvgCPUAcrossVMSS, 1), "%/", round(MaxCPUInVMSS, 1), "% ",
+        "| MEM:", round(AvgMemoryUsage, 1), "%/", round(MaxMemoryUsage, 1), "% ",
+        "| DISK:", round(AvgDiskSpace, 1), "% ",
+        "| NET:", round(AvgNetworkMbps, 1), "Mbps"
+    )
+| project 
+    VMSSName,
+    ResourceGroupName,
+    OverallRAGStatus,
+    HealthPercentage,
+    PriorityScore,
+    TotalInstances,
+    HealthyInstances,
+    WarningInstances, 
+    CriticalInstances,
+    ResourceSummary,
+    CPUTrend,
+    IssuesSummary = iff(isempty(IssuesSummary), "✅ ALL SYSTEMS NOMINAL", IssuesSummary),
+    WorstCPUInstance,
+    WorstMemoryInstance,
+    LastUpdate
+| sort by 
+    PriorityScore asc,  // Critical issues first
+    HealthPercentage asc,  // Worst health first within same priority
+    VMSSName asc
+
+// =========================================================
+// QUERY CUSTOMIZATION NOTES:
+// =========================================================
+// 1. Adjust threshold values at the top of the query
+// 2. Modify service names in ServiceHealth section
+// 3. Update memory assumptions (currently 8GB VMs)
+// 4. Change disk drive letters (C: for Windows, / for Linux)
+// 5. Add custom performance counters as needed
+// =========================================================
