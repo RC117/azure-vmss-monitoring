@@ -1,0 +1,17 @@
+# Azure Configuration - REPLACE WITH YOUR VALUES
+subscription_id = "12345678-1234-1234-1234-123456789abc"  # Your subscription ID
+tenant_id      = "87654321-4321-4321-4321-cba987654321"  # Your tenant ID
+location       = "East US"                               # Your preferred region
+
+# Project Configuration
+environment         = "dev"
+resource_group_name = "rg-vmss-monitoring-dev"
+workspace_name     = "law-vmss-monitoring-dev"
+retention_days     = 30
+
+# VMSS Configuration - ADD YOUR VMSS RESOURCE GROUPS
+vmss_resource_groups = [
+  "rg-web-dev",
+  "rg-api-dev"
+  # Add your actual resource group names here
+]

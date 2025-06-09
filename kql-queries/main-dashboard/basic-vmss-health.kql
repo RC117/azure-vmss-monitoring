@@ -1,0 +1,36 @@
+// Basic VMSS Health Check Query
+// This is a starter query - more comprehensive queries will be added later
+
+Heartbeat
+| where TimeGenerated > ago(10m)
+| where Computer startswith "vmss"
+| summarize LastSeen = max(TimeGenerated) by Computer
+| extend MinutesAgo = datetime_diff('minute', now(), LastSeen)
+| extend Status = case(
+    MinutesAgo <= 2, "🟢 Healthy",
+    MinutesAgo <= 5, "🟡 Warning", 
+    "🔴 Critical"
+)
+| join kind=leftouter (
+    VMComputer
+    | where TimeGenerated > ago(1h)
+    | extend VMSSName = case(
+        AzureResourceName contains "_", tostring(split(AzureResourceName, "_")[0]),
+        AzureResourceName
+    )
+    | distinct Computer, VMSSName, ResourceGroupName=AzureResourceGroup
+) on Computer
+| where isnotempty(VMSSName)
+| summarize 
+    TotalInstances = count(),
+    HealthyCount = countif(Status contains "🟢"),
+    WarningCount = countif(Status contains "🟡"),
+    CriticalCount = countif(Status contains "🔴")
+    by VMSSName, ResourceGroupName
+| extend OverallStatus = case(
+    CriticalCount > 0, "🔴 CRITICAL",
+    WarningCount > 0, "🟡 WARNING",
+    "🟢 HEALTHY"
+)
+| project VMSSName, ResourceGroupName, OverallStatus, TotalInstances, HealthyCount, WarningCount, CriticalCount
+| sort by OverallStatus asc, VMSSName asc
